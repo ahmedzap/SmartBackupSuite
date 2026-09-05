@@ -1,7 +1,4 @@
-﻿
-
-
-using Dropbox.Api;
+﻿using Dropbox.Api;
 using Dropbox.Api.Files;
 using Google.Apis.Auth.OAuth2;
 using Google.Apis.Drive.v3;
@@ -12,6 +9,7 @@ using Microsoft.Graph;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
@@ -38,7 +36,8 @@ namespace SmartBackupSuite.Services
         private static UserCredential _googleCredential = null;
         private static bool _googleAuthorized = false;
         private static bool _credentialsLoaded = false;
-        private static string _cachedFolderId = null;
+        // ✅ تخزين مؤقت منفصل لكل مجلد (Cache Key -> Folder ID)
+        private static readonly Dictionary<string, string> _cachedFolderIds = new Dictionary<string, string>();
         private const string DEFAULT_FOLDER_NAME = "SmartBackup";
 
         // ==================== إعدادات Dropbox ====================
@@ -206,22 +205,27 @@ namespace SmartBackupSuite.Services
             }
         }
 
+        /// <summary>
+        /// ✅ يدعم الآن مهمات متعددة إلى مجلدات مختلفة عبر تخزين مؤقت منفصل لكل Cache Key
+        /// </summary>
         private static async Task<string> GetOrCreateFolder(DriveService service, string folderId = null, string folderName = DEFAULT_FOLDER_NAME)
         {
-            if (!string.IsNullOrEmpty(_cachedFolderId))
+            string cacheKey = folderId ?? folderName;
+
+            if (_cachedFolderIds.TryGetValue(cacheKey, out string cachedId))
             {
                 try
                 {
-                    var checkRequest = service.Files.Get(_cachedFolderId);
+                    var checkRequest = service.Files.Get(cachedId);
                     checkRequest.Fields = "id, name";
                     var folder = await checkRequest.ExecuteAsync();
-                    LogService.WriteLog("GoogleDrive", "Info", $"✅ استخدام المجلد المخزن: {folder.Name} (ID: {folder.Id})");
-                    return _cachedFolderId;
+                    LogService.WriteLog("GoogleDrive", "Info", $"✅ استخدام المجلد المخزن [{cacheKey}]: {folder.Name} (ID: {folder.Id})");
+                    return cachedId;
                 }
                 catch
                 {
-                    _cachedFolderId = null;
-                    LogService.WriteLog("GoogleDrive", "Warning", "⚠️ المجلد المخزن غير صالح، جاري البحث مرة أخرى...");
+                    _cachedFolderIds.Remove(cacheKey);
+                    LogService.WriteLog("GoogleDrive", "Warning", $"⚠️ المجلد المخزن غير صالح [{cacheKey}]، جاري البحث مرة أخرى...");
                 }
             }
 
@@ -233,7 +237,7 @@ namespace SmartBackupSuite.Services
                     checkRequest.Fields = "id, name";
                     var folder = await checkRequest.ExecuteAsync();
                     LogService.WriteLog("GoogleDrive", "Info", $"✅ تم العثور على المجلد: {folder.Name} (ID: {folder.Id})");
-                    _cachedFolderId = folder.Id;
+                    _cachedFolderIds[cacheKey] = folder.Id;
                     return folder.Id;
                 }
                 catch
@@ -246,19 +250,19 @@ namespace SmartBackupSuite.Services
             if (!string.IsNullOrEmpty(existingFolderId))
             {
                 LogService.WriteLog("GoogleDrive", "Info", $"✅ تم العثور على المجلد: {folderName} (ID: {existingFolderId})");
-                _cachedFolderId = existingFolderId;
+                _cachedFolderIds[cacheKey] = existingFolderId;
                 return existingFolderId;
             }
 
             string newFolderId = await CreateFolder(service, folderName);
-            _cachedFolderId = newFolderId;
+            _cachedFolderIds[cacheKey] = newFolderId;
             return newFolderId;
         }
 
         public static void ResetGoogleDriveCache()
         {
-            _cachedFolderId = null;
-            LogService.WriteLog("GoogleDrive", "Info", "🔄 تم إعادة تعيين التخزين المؤقت للمجلد");
+            _cachedFolderIds.Clear();
+            LogService.WriteLog("GoogleDrive", "Info", "🔄 تم إعادة تعيين التخزين المؤقت للمجلدات");
         }
 
         public static async Task<bool> UploadToGoogleDrive(string filePath, string folderId = null)
@@ -351,6 +355,68 @@ namespace SmartBackupSuite.Services
             {
                 LogService.WriteLog("GoogleDrive", "Error", $"❌ فشل الرفع: {ex.Message}");
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// تطبيق سياسة الاحتفاظ على Google Drive - تحذف الملفات القديمة بناءً على العدد المحدد
+        /// </summary>
+        public static async Task ApplyRetentionPolicyGoogleDrive(string folderId, string dbNamePrefix, int retentionCount)
+        {
+            try
+            {
+                if (retentionCount <= 0) return;
+                if (!_googleAuthorized || _googleCredential == null)
+                {
+                    LogService.WriteLog("GoogleDrive", "Warning", "⚠️ لا يمكن تطبيق سياسة الاحتفاظ - لم تتم المصادقة");
+                    return;
+                }
+
+                var service = new DriveService(new BaseClientService.Initializer()
+                {
+                    HttpClientInitializer = _googleCredential,
+                    ApplicationName = "Smart Backup Suite",
+                    HttpClientTimeout = TimeSpan.FromMinutes(5)
+                });
+
+                string targetFolderId = await GetOrCreateFolder(service, folderId, DEFAULT_FOLDER_NAME);
+
+                var request = service.Files.List();
+                request.Q = $"'{targetFolderId}' in parents and trashed=false and name contains '{dbNamePrefix}_'";
+                request.Fields = "files(id, name, createdTime)";
+                request.OrderBy = "createdTime";
+                request.PageSize = 1000;
+
+                var result = await request.ExecuteAsync();
+                var files = result.Files;
+
+                if (files == null || files.Count <= retentionCount) return;
+
+                int filesToDelete = files.Count - retentionCount;
+                int deletedCount = 0;
+
+                for (int i = 0; i < filesToDelete; i++)
+                {
+                    try
+                    {
+                        await service.Files.Delete(files[i].Id).ExecuteAsync();
+                        deletedCount++;
+                        LogService.WriteLog("GoogleDrive", "Info", $"🗑️ تم حذف الملف القديم: {files[i].Name}");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogService.WriteLog("GoogleDrive", "Warning", $"⚠️ فشل حذف الملف {files[i].Name}: {ex.Message}");
+                    }
+                }
+
+                if (deletedCount > 0)
+                {
+                    LogService.WriteLog("GoogleDrive", "Info", $"✅ تم حذف {deletedCount} ملفات قديمة من Google Drive");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogService.WriteLog("GoogleDrive", "Error", $"❌ فشل تطبيق سياسة الاحتفاظ: {ex.Message}");
             }
         }
 
@@ -492,6 +558,64 @@ namespace SmartBackupSuite.Services
             {
                 LogService.WriteLog("Dropbox", "Error", $"❌ فشل الرفع: {ex.Message}");
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// تطبيق سياسة الاحتفاظ على Dropbox - تحذف الملفات القديمة بناءً على العدد المحدد
+        /// </summary>
+        public static async Task ApplyRetentionPolicyDropbox(string folderPath, string dbNamePrefix, int retentionCount)
+        {
+            try
+            {
+                if (retentionCount <= 0) return;
+
+                string accessToken = await GetDropboxAccessToken();
+                if (string.IsNullOrEmpty(accessToken))
+                {
+                    LogService.WriteLog("Dropbox", "Warning", "⚠️ لا يمكن تطبيق سياسة الاحتفاظ - لم تتم المصادقة");
+                    return;
+                }
+
+                string normalizedPath = folderPath.Replace("//", "/");
+                if (!normalizedPath.StartsWith("/")) normalizedPath = "/" + normalizedPath;
+
+                using (var dbx = new DropboxClient(accessToken))
+                {
+                    var listResult = await dbx.Files.ListFolderAsync(normalizedPath);
+                    var files = listResult.Entries
+                        .Where(e => e.IsFile && e.Name.StartsWith(dbNamePrefix + "_"))
+                        .OrderBy(e => e.AsFile.ClientModified)
+                        .ToList();
+
+                    if (files.Count <= retentionCount) return;
+
+                    int filesToDelete = files.Count - retentionCount;
+                    int deletedCount = 0;
+
+                    for (int i = 0; i < filesToDelete; i++)
+                    {
+                        try
+                        {
+                            await dbx.Files.DeleteV2Async(files[i].PathDisplay);
+                            deletedCount++;
+                            LogService.WriteLog("Dropbox", "Info", $"🗑️ تم حذف الملف القديم: {files[i].Name}");
+                        }
+                        catch (Exception ex)
+                        {
+                            LogService.WriteLog("Dropbox", "Warning", $"⚠️ فشل حذف الملف {files[i].Name}: {ex.Message}");
+                        }
+                    }
+
+                    if (deletedCount > 0)
+                    {
+                        LogService.WriteLog("Dropbox", "Info", $"✅ تم حذف {deletedCount} ملفات قديمة من Dropbox");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogService.WriteLog("Dropbox", "Error", $"❌ فشل تطبيق سياسة الاحتفاظ: {ex.Message}");
             }
         }
 
@@ -800,6 +924,23 @@ namespace SmartBackupSuite.Services
             }
         }
 
+        /// <summary>
+        /// تطبيق سياسة الاحتفاظ على OneDrive (تجريبي - يحتاج تنفيذ كامل لـ Graph API)
+        /// </summary>
+        public static async Task ApplyRetentionPolicyOneDrive(string folderPath, string dbNamePrefix, int retentionCount)
+        {
+            try
+            {
+                if (retentionCount <= 0) return;
+                LogService.WriteLog("OneDrive", "Info", "ℹ️ سياسة الاحتفاظ على OneDrive غير مفعلة حالياً (تجريبي)");
+                await Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                LogService.WriteLog("OneDrive", "Error", $"❌ فشل تطبيق سياسة الاحتفاظ: {ex.Message}");
+            }
+        }
+
         private static async Task<bool> AuthenticateOneDrive()
         {
             try
@@ -923,6 +1064,23 @@ namespace SmartBackupSuite.Services
             }
         }
 
+        /// <summary>
+        /// تطبيق سياسة الاحتفاظ على AWS S3 (تجريبي)
+        /// </summary>
+        public static async Task ApplyRetentionPolicyS3(string bucketName, string dbNamePrefix, int retentionCount, string accessKey, string secretKey, string region)
+        {
+            try
+            {
+                if (retentionCount <= 0) return;
+                LogService.WriteLog("S3", "Info", "ℹ️ سياسة الاحتفاظ على S3 غير مفعلة حالياً (تجريبي)");
+                await Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                LogService.WriteLog("S3", "Error", $"❌ فشل تطبيق سياسة الاحتفاظ: {ex.Message}");
+            }
+        }
+
         // ==================== Azure Blob ====================
         public static async Task<bool> UploadToAzure(string filePath, string containerName, string connectionString)
         {
@@ -958,6 +1116,23 @@ namespace SmartBackupSuite.Services
             {
                 LogService.WriteLog("Azure", "Error", $"❌ فشل الرفع: {ex.Message}");
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// تطبيق سياسة الاحتفاظ على Azure Blob (تجريبي)
+        /// </summary>
+        public static async Task ApplyRetentionPolicyAzure(string containerName, string dbNamePrefix, int retentionCount, string connectionString)
+        {
+            try
+            {
+                if (retentionCount <= 0) return;
+                LogService.WriteLog("Azure", "Info", "ℹ️ سياسة الاحتفاظ على Azure غير مفعلة حالياً (تجريبي)");
+                await Task.CompletedTask;
+            }
+            catch (Exception ex)
+            {
+                LogService.WriteLog("Azure", "Error", $"❌ فشل تطبيق سياسة الاحتفاظ: {ex.Message}");
             }
         }
 

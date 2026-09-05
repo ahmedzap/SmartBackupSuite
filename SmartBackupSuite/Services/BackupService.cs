@@ -181,6 +181,9 @@ namespace SmartBackupSuite.Services
                                 LogService.WriteLog(job.JobName, "Info", $"جاري الرفع إلى {destination.DestinationType}");
                                 await UploadToCloud(finalFilePath, destination, dbName);
                                 LogService.WriteLog(job.JobName, "Success", $"✅ تم رفع الملف بنجاح إلى {destination.DestinationType}");
+
+                                // ✅ تطبيق سياسة الاحتفاظ على السحابة بعد الرفع الناجح
+                                await ApplyCloudRetentionPolicy(job, destination, dbName);
                             }
                             catch (Exception ex)
                             {
@@ -245,10 +248,10 @@ namespace SmartBackupSuite.Services
                     catch { }
                 }
 
-                // تطبيق سياسة الاحتفاظ
+                // تطبيق سياسة الاحتفاظ المحلية
                 if (job.KeepLocalCopy && Directory.Exists(backupPath) && backupPath != TempBackupPath)
                 {
-                    LogService.WriteLog(job.JobName, "Info", "جاري تطبيق سياسة الاحتفاظ");
+                    LogService.WriteLog(job.JobName, "Info", "جاري تطبيق سياسة الاحتفاظ المحلية");
                     ApplyRetentionPolicy(job, destination, backupPath);
                 }
 
@@ -387,7 +390,7 @@ namespace SmartBackupSuite.Services
                     {statusText}
                 </span>
             </div>
-            
+
             <div class='details'>
                 <table>
                     <tr><td>📌 اسم المهمة</td><td>{job.JobName}</td></tr>
@@ -433,6 +436,57 @@ namespace SmartBackupSuite.Services
         }
 
         #endregion
+
+        // ==================== دوال سياسة الاحتفاظ ====================
+
+        /// <summary>
+        /// تطبيق سياسة الاحتفاظ على السحابة بعد الرفع الناجح
+        /// </summary>
+        private async Task ApplyCloudRetentionPolicy(BackupJob job, Destination destination, string dbName)
+        {
+            try
+            {
+                if (job.RetentionCount <= 0) return;
+
+                LogService.WriteLog(job.JobName, "Info", $"☁️ جاري تطبيق سياسة الاحتفاظ على السحابة للقاعدة: {dbName}");
+
+                switch (destination.DestinationType)
+                {
+                    case "GoogleDrive":
+                        await CloudUploadService.ApplyRetentionPolicyGoogleDrive(
+                            destination.GoogleDriveFolderId, dbName, job.RetentionCount);
+                        break;
+
+                    case "Dropbox":
+                        await CloudUploadService.ApplyRetentionPolicyDropbox(
+                            destination.DropboxFolderPath ?? "/Backups", dbName, job.RetentionCount);
+                        break;
+
+                    case "OneDrive":
+                        await CloudUploadService.ApplyRetentionPolicyOneDrive(
+                            destination.OneDriveFolderPath ?? "/Backups", dbName, job.RetentionCount);
+                        break;
+
+                    case "S3":
+                        await CloudUploadService.ApplyRetentionPolicyS3(
+                            destination.S3BucketName, dbName, job.RetentionCount,
+                            destination.S3AccessKey, destination.S3SecretKey, destination.S3Region);
+                        break;
+
+                    case "Azure":
+                        await CloudUploadService.ApplyRetentionPolicyAzure(
+                            destination.AzureContainerName, dbName, job.RetentionCount,
+                            destination.AzureConnectionString);
+                        break;
+                }
+
+                LogService.WriteLog(job.JobName, "Info", $"✅ تم تطبيق سياسة الاحتفاظ على السحابة للقاعدة: {dbName}");
+            }
+            catch (Exception ex)
+            {
+                LogService.WriteLog(job.JobName, "Warning", $"⚠️ فشل تطبيق سياسة الاحتفاظ على السحابة: {ex.Message}");
+            }
+        }
 
         // ==================== دوال مساعدة (بدون تغيير) ====================
 
